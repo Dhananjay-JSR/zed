@@ -8,7 +8,7 @@ use agent_client_protocol::schema::{v1 as acp_v1, v2 as acp_v2};
 use std::{cell::RefCell, path::Path};
 
 use acp_thread::{
-    Elicitation, ElicitationEntryId, ElicitationStatus, ForegroundActivity,
+    BackgroundTaskState, Elicitation, ElicitationEntryId, ElicitationStatus, ForegroundActivity,
     SandboxAuthorizationDetails, SandboxFallbackAuthorizationDetails, SandboxNotAppliedReason,
     SubmissionId, SubmissionResponse, SubmissionState, decode_path_escapes,
 };
@@ -9325,7 +9325,56 @@ impl ThreadView {
                     this.child(body)
                 }
             })
+            .children(self.render_background_task(tool_call, cx))
             .children(permission_buttons)
+    }
+
+    /// The work a tool call left running after it returned.
+    ///
+    /// A backgrounded command outlives the call that started it, so the card
+    /// goes to "completed" while the command runs on. This line is what keeps
+    /// the card honest about that: the call is done, the work it started is
+    /// not.
+    fn render_background_task(
+        &self,
+        tool_call: &ToolCall,
+        _cx: &Context<Self>,
+    ) -> Option<AnyElement> {
+        let task = tool_call.background_task.as_ref()?;
+        let (icon, color, state) = match task.state {
+            BackgroundTaskState::Running => (
+                IconName::ArrowCircle,
+                Color::Accent,
+                "Running in background",
+            ),
+            BackgroundTaskState::Paused => (IconName::Stop, Color::Muted, "Paused in background"),
+            BackgroundTaskState::Completed => {
+                (IconName::Check, Color::Success, "Finished in background")
+            }
+            BackgroundTaskState::Failed => {
+                (IconName::XCircle, Color::Error, "Failed in background")
+            }
+            BackgroundTaskState::Stopped => (IconName::Stop, Color::Muted, "Stopped"),
+        };
+        let label = match task.summary.as_ref() {
+            Some(summary) => format!("{state} — {summary}"),
+            None => state.to_owned(),
+        };
+
+        Some(
+            h_flex()
+                .gap_1p5()
+                .px_2()
+                .pb_1()
+                .child(Icon::new(icon).size(IconSize::XSmall).color(color))
+                .child(
+                    Label::new(label)
+                        .size(LabelSize::Small)
+                        .color(Color::Muted)
+                        .truncate(),
+                )
+                .into_any_element(),
+        )
     }
 
     /// A small "Learn more" link to the sandboxing docs, deep-linked to

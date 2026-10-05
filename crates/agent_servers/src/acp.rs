@@ -1,3 +1,4 @@
+mod async_tasks;
 mod debug_log;
 mod subagent_updates;
 mod terminal_updates;
@@ -116,12 +117,28 @@ impl<T> FlattenAcpResult<T> for Result<Result<T, acp::Error>, anyhow::Error> {
 struct ClientContext {
     sessions: Rc<RefCell<HashMap<acp::SessionId, AcpSession>>>,
     subagents: SubagentThreads,
+    async_tasks: AsyncTasks,
     session_list: Rc<RefCell<Option<Rc<AcpSessionList>>>>,
     request_elicitations: Entity<ElicitationStore>,
 }
 
 /// The child sessions an agent announced on this connection.
 type SubagentThreads = Rc<RefCell<HashMap<acp::SessionId, Subagent>>>;
+
+/// The background work an agent announced on this connection.
+///
+/// An agent reports each update of a task as only the fields that changed, so
+/// what the client knows about a task has to be kept somewhere to be told to
+/// the tool call as a whole.
+type AsyncTasks = Rc<RefCell<HashMap<async_tasks::AsyncTaskId, AsyncTask>>>;
+
+struct AsyncTask {
+    session_id: acp::SessionId,
+    /// The tool call that started the work. An agent can report it later than
+    /// the spawn, and until it does there is no card to report the work on.
+    tool_call_id: Option<acp::ToolCallId>,
+    task: acp_thread::BackgroundTask,
+}
 
 /// A child session the agent created to do delegated work.
 struct Subagent {
@@ -648,10 +665,26 @@ fn client_builder(
                     let Some(decoded) =
                         subagent_updates::inspect(message.method(), message.params())
                     else {
-                        return Ok(Handled::No {
-                            message: (message, connection),
-                            retry: false,
-                        });
+                        match async_tasks::decode(message.method(), message.params()) {
+                            Some(Ok(notification)) => {
+                                enqueue_notification(
+                                    &dispatch_sender,
+                                    notification,
+                                    handle_async_task_notification,
+                                );
+                                return Ok(Handled::Yes);
+                            }
+                            Some(Err(error)) => {
+                                log::warn!("Failed to decode an async task update: {error:#}");
+                                return Ok(Handled::Yes);
+                            }
+                            None => {
+                                return Ok(Handled::No {
+                                    message: (message, connection),
+                                    retry: false,
+                                });
+                            }
+                        }
                     };
                     match decoded {
                         Ok(subagent_updates::InboundUpdate::Subagent(notification)) => {
@@ -805,6 +838,9 @@ fn client_capabilities_for_agent(
     let mut meta = acp::Meta::from_iter([
         ("terminal_output".into(), true.into()),
         ("terminal-auth".into(), true.into()),
+        // Report work a tool call left running instead of letting the card
+        // that started it read as finished.
+        ("asyncTasks".into(), serde_json::json!({})),
     ]);
 
     if agent_id.as_ref() == CURSOR_ID {
@@ -865,6 +901,7 @@ impl AcpConnection {
         } = transport::spawn_stdio(&project, command, cx)?;
         let sessions = Rc::new(RefCell::new(HashMap::default()));
         let subagents: SubagentThreads = Rc::new(RefCell::new(HashMap::default()));
+        let async_tasks: AsyncTasks = Rc::new(RefCell::new(HashMap::default()));
 
         let (release_channel, version): (Option<&str>, String) = cx.update(|cx| {
             (
@@ -927,6 +964,7 @@ impl AcpConnection {
         let dispatch_context = ClientContext {
             sessions: sessions.clone(),
             subagents: subagents.clone(),
+            async_tasks: async_tasks.clone(),
             session_list: client_session_list.clone(),
             request_elicitations: request_elicitations.clone(),
         };
@@ -2479,6 +2517,7 @@ pub mod test_support {
         let sessions: Rc<RefCell<HashMap<acp::SessionId, AcpSession>>> =
             Rc::new(RefCell::new(HashMap::default()));
         let subagents: SubagentThreads = Rc::new(RefCell::new(HashMap::default()));
+        let async_tasks: AsyncTasks = Rc::new(RefCell::new(HashMap::default()));
         let client_session_list: Rc<RefCell<Option<Rc<AcpSessionList>>>> =
             Rc::new(RefCell::new(None));
 
@@ -2635,6 +2674,7 @@ pub mod test_support {
         let dispatch_context = ClientContext {
             sessions: sessions.clone(),
             subagents: subagents.clone(),
+            async_tasks: async_tasks.clone(),
             session_list: client_session_list.clone(),
             request_elicitations: request_elicitations.clone(),
         };
@@ -5255,6 +5295,7 @@ exit 7
         let sessions: Rc<RefCell<HashMap<acp::SessionId, AcpSession>>> =
             Rc::new(RefCell::new(HashMap::default()));
         let subagents: SubagentThreads = Rc::new(RefCell::new(HashMap::default()));
+        let async_tasks: AsyncTasks = Rc::new(RefCell::new(HashMap::default()));
         let client_session_list: Rc<RefCell<Option<Rc<AcpSessionList>>>> =
             Rc::new(RefCell::new(None));
 
@@ -5402,6 +5443,7 @@ exit 7
         let dispatch_context = ClientContext {
             sessions: sessions.clone(),
             subagents: subagents.clone(),
+            async_tasks: async_tasks.clone(),
             session_list: client_session_list.clone(),
             request_elicitations: request_elicitations.clone(),
         };
@@ -5577,6 +5619,124 @@ exit 7
                 !transcript.contains("looking"),
                 "the child's work must stay out of the parent transcript, got: {transcript}"
             );
+        });
+    }
+
+    #[gpui::test]
+    async fn background_work_keeps_reporting_to_the_call_that_started_it(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (agent_sender, agent_receiver) = futures::channel::oneshot::channel();
+        let (connection, project, _, _, _, _, _keep_agent_alive) =
+            connect_fake_agent_with_handle(None, Some(agent_sender), cx).await;
+        let agent = agent_receiver.await.expect("fake agent handle");
+
+        let session_id = acp::SessionId::new("task-session");
+        let thread = cx
+            .update(|cx| {
+                connection.clone().load_session(
+                    session_id.clone(),
+                    project,
+                    PathList::new(&[std::path::Path::new("/a")]),
+                    None,
+                    cx,
+                )
+            })
+            .await
+            .expect("load session");
+
+        // The command's own call finishes as soon as the command detaches.
+        let tool_call_id = acp::ToolCallId::new("toolu_1");
+        for update in [
+            acp::SessionUpdate::ToolCall(
+                acp::ToolCall::new(tool_call_id.clone(), "sleep 20 && echo done")
+                    .kind(acp::ToolKind::Execute),
+            ),
+            acp::SessionUpdate::ToolCallUpdate(acp::ToolCallUpdate::new(
+                tool_call_id.clone(),
+                acp::ToolCallUpdateFields::new().status(acp::ToolCallStatus::Completed),
+            )),
+        ] {
+            agent
+                .send_notification(acp::SessionNotification::new(session_id.clone(), update))
+                .expect("the call should reach the client");
+        }
+        cx.run_until_parked();
+
+        agent
+            .send_notification(raw_session_update(
+                "task-session",
+                serde_json::json!({
+                    "sessionUpdate": "async_task_spawned",
+                    "asyncTaskId": "task-1",
+                    "name": "sleep 20 && echo done",
+                    "taskType": "shell",
+                    "description": "Sleep then print",
+                    "showInTranscript": false,
+                    "canStop": true,
+                    "toolCallId": "toolu_1",
+                }),
+            ))
+            .expect("the spawn should reach the client");
+        cx.run_until_parked();
+
+        thread.read_with(cx, |thread, _| {
+            let (_, tool_call) = thread.tool_call(&tool_call_id).expect("the call");
+            let task = tool_call
+                .background_task
+                .as_ref()
+                .expect("the call should report the work it left running");
+            assert_eq!(task.name.as_ref(), "sleep 20 && echo done");
+            assert!(task.state.is_running());
+            assert_eq!(
+                tool_call.status(),
+                acp_thread::ToolCallStatus::Completed,
+                "the call itself did finish; only the work it started has not"
+            );
+        });
+
+        // Each update reports only what changed, so the rest must be kept.
+        agent
+            .send_notification(raw_session_update(
+                "task-session",
+                serde_json::json!({
+                    "sessionUpdate": "async_task_progress",
+                    "asyncTaskId": "task-1",
+                    "outputFilePath": "/tmp/task-1.output",
+                }),
+            ))
+            .expect("the progress should reach the client");
+        cx.run_until_parked();
+
+        thread.read_with(cx, |thread, _| {
+            let (_, tool_call) = thread.tool_call(&tool_call_id).expect("the call");
+            let task = tool_call.background_task.as_ref().expect("the work");
+            assert_eq!(task.output_file_path.as_deref(), Some("/tmp/task-1.output"));
+            assert_eq!(
+                task.name.as_ref(),
+                "sleep 20 && echo done",
+                "a partial update must not drop what the spawn reported"
+            );
+        });
+
+        agent
+            .send_notification(raw_session_update(
+                "task-session",
+                serde_json::json!({
+                    "sessionUpdate": "async_task_state_update",
+                    "asyncTaskId": "task-1",
+                    "state": "failed",
+                    "summary": "exit code 1",
+                }),
+            ))
+            .expect("the state change should reach the client");
+        cx.run_until_parked();
+
+        thread.read_with(cx, |thread, _| {
+            let (_, tool_call) = thread.tool_call(&tool_call_id).expect("the call");
+            let task = tool_call.background_task.as_ref().expect("the work");
+            assert_eq!(task.state, acp_thread::BackgroundTaskState::Failed);
+            assert_eq!(task.summary.as_deref(), Some("exit code 1"));
         });
     }
 
@@ -7176,6 +7336,138 @@ fn handle_subagent_attribution(
                 .log_err();
         });
     });
+}
+
+/// Tells the tool call that started background work how that work is going.
+///
+/// The call that backgrounds a command returns as soon as the command is
+/// handed off, so without this the card reads as finished while the command
+/// runs on for minutes. Each update reports only what changed, so we keep what
+/// the task has told us and report the whole of it to the call every time.
+fn handle_async_task_notification(
+    notification: async_tasks::AsyncTaskNotification,
+    cx: &mut AsyncApp,
+    ctx: &ClientContext,
+) {
+    let async_tasks::AsyncTaskNotification {
+        session_id,
+        task_id,
+        update,
+    } = notification;
+
+    let report = {
+        let mut tasks = ctx.async_tasks.borrow_mut();
+        match update {
+            async_tasks::AsyncTaskUpdate::Spawned(spawned) => {
+                let task = tasks.entry(task_id).or_insert_with(|| AsyncTask {
+                    session_id,
+                    tool_call_id: None,
+                    task: acp_thread::BackgroundTask {
+                        name: SharedString::default(),
+                        state: acp_thread::BackgroundTaskState::Running,
+                        summary: None,
+                        output_file_path: None,
+                    },
+                });
+                task.tool_call_id = spawned.tool_call_id.or_else(|| task.tool_call_id.clone());
+                task.task.name = SharedString::from(if spawned.name.is_empty() {
+                    spawned.description
+                } else {
+                    spawned.name
+                });
+                if let Some(path) = spawned.output_file_path {
+                    task.task.output_file_path = Some(SharedString::from(path));
+                }
+                task_report(task)
+            }
+            async_tasks::AsyncTaskUpdate::Progress(progress) => {
+                let Some(task) = tasks.get_mut(&task_id) else {
+                    // Progress for work we were never told about: there is no
+                    // card to report it on.
+                    return;
+                };
+                if let Some(tool_call_id) = progress.tool_call_id {
+                    task.tool_call_id = Some(tool_call_id);
+                }
+                // The latest thing the work said about itself, whichever way
+                // the agent phrased it.
+                if let Some(summary) = progress.summary.or(progress.description) {
+                    task.task.summary = Some(SharedString::from(summary));
+                } else if let Some(last_tool) = progress.last_tool_name {
+                    task.task.summary = Some(SharedString::from(last_tool));
+                }
+                if let Some(path) = progress.output_file_path {
+                    task.task.output_file_path = Some(SharedString::from(path));
+                }
+                task_report(task)
+            }
+            async_tasks::AsyncTaskUpdate::StateChanged(changed) => {
+                let Some(task) = tasks.get_mut(&task_id) else {
+                    return;
+                };
+                task.task.state = match changed.state {
+                    async_tasks::AsyncTaskState::Running => {
+                        acp_thread::BackgroundTaskState::Running
+                    }
+                    async_tasks::AsyncTaskState::Paused => acp_thread::BackgroundTaskState::Paused,
+                    async_tasks::AsyncTaskState::Completed => {
+                        acp_thread::BackgroundTaskState::Completed
+                    }
+                    async_tasks::AsyncTaskState::Failed => acp_thread::BackgroundTaskState::Failed,
+                    async_tasks::AsyncTaskState::Stopped => {
+                        acp_thread::BackgroundTaskState::Stopped
+                    }
+                };
+                if let Some(summary) = changed.summary {
+                    task.task.summary = Some(SharedString::from(summary));
+                }
+                let report = task_report(task);
+                if !changed.state.is_running() {
+                    // Nothing more will be reported for this work.
+                    tasks.remove(&task_id);
+                }
+                report
+            }
+        }
+    };
+
+    let Some((session_id, tool_call_id, task)) = report else {
+        return;
+    };
+    let Some(thread) = ctx
+        .sessions
+        .borrow()
+        .get(&session_id)
+        .and_then(|session| session.thread.upgrade())
+    else {
+        return;
+    };
+
+    cx.update(|cx| {
+        thread.update(cx, |thread, cx| {
+            let Some(task) = serde_json::to_value(task).log_err() else {
+                return;
+            };
+            let update =
+                acp::ToolCallUpdate::new(tool_call_id, acp::ToolCallUpdateFields::new()).meta(
+                    acp::Meta::from_iter([(acp_thread::BACKGROUND_TASK_META_KEY.into(), task)]),
+                );
+            thread
+                .handle_session_update(acp::SessionUpdate::ToolCallUpdate(update), cx)
+                .log_err();
+        });
+    });
+}
+
+/// What to report to the tool call, once the agent has named one.
+fn task_report(
+    task: &AsyncTask,
+) -> Option<(acp::SessionId, acp::ToolCallId, acp_thread::BackgroundTask)> {
+    Some((
+        task.session_id.clone(),
+        task.tool_call_id.clone()?,
+        task.task.clone(),
+    ))
 }
 
 fn handle_session_notification(

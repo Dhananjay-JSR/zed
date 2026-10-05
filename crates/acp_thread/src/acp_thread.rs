@@ -305,6 +305,51 @@ pub fn subagent_session_info_from_meta(meta: &Option<acp_v1::Meta>) -> Option<Su
         .and_then(|v| serde_json::from_value(v.clone()).ok())
 }
 
+/// Key used in ACP ToolCall meta to describe work the call left running.
+pub const BACKGROUND_TASK_META_KEY: &str = "background_task";
+
+/// Work a tool call started and left running after the call returned.
+///
+/// A backgrounded command, a workflow, a monitor: the call that started it is
+/// done as soon as the work is handed off, so without this the card reads as
+/// finished while the work itself is still going.
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
+pub struct BackgroundTask {
+    /// What to call the work, e.g. the command that was backgrounded.
+    pub name: SharedString,
+    pub state: BackgroundTaskState,
+    /// The latest thing the work reported about itself, when it reports.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub summary: Option<SharedString>,
+    /// A file the work appends its output to, when it has one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_file_path: Option<SharedString>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BackgroundTaskState {
+    Running,
+    Paused,
+    Completed,
+    Failed,
+    /// Stopped before it finished.
+    Stopped,
+}
+
+impl BackgroundTaskState {
+    pub fn is_running(self) -> bool {
+        matches!(self, Self::Running | Self::Paused)
+    }
+}
+
+/// Helper to extract work left running by a tool call from ACP meta.
+pub fn background_task_from_meta(meta: &Option<acp_v1::Meta>) -> Option<BackgroundTask> {
+    meta.as_ref()
+        .and_then(|m| m.get(BACKGROUND_TASK_META_KEY))
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+}
+
 #[derive(Debug)]
 pub struct UserMessage {
     pub identity: MessageIdentity,
@@ -1045,6 +1090,7 @@ pub struct ToolCall {
     raw_output_content: Option<Box<ToolCallContent>>,
     pub tool_name: Option<SharedString>,
     pub subagent_session_info: Option<SubagentSessionInfo>,
+    pub background_task: Option<BackgroundTask>,
     pub sandbox_authorization_details: Option<SandboxAuthorizationDetails>,
     pub sandbox_fallback_authorization_details: Option<SandboxFallbackAuthorizationDetails>,
     /// Why this terminal command ran without the OS sandbox even though
@@ -1262,6 +1308,7 @@ impl ToolCall {
         };
         let tool_name = name.clone().or_else(|| tool_name_from_meta(&meta));
         let subagent_session_info = subagent_session_info_from_meta(&meta);
+        let background_task = background_task_from_meta(&meta);
         let sandbox_authorization_details = sandbox_authorization_details_from_meta(&meta);
         let sandbox_fallback_authorization_details =
             sandbox_fallback_authorization_details_from_meta(&meta);
@@ -1293,6 +1340,7 @@ impl ToolCall {
             raw_output_content: None,
             tool_name,
             subagent_session_info,
+            background_task,
             sandbox_authorization_details,
             sandbox_fallback_authorization_details,
             sandbox_not_applied,
@@ -1456,6 +1504,9 @@ impl ToolCall {
                 if let Some(value) = subagent_session_info_from_meta(&meta) {
                     self.subagent_session_info = Some(value);
                 }
+                if let Some(value) = background_task_from_meta(&meta) {
+                    self.background_task = Some(value);
+                }
                 if let Some(value) = sandbox_authorization_details_from_meta(&meta) {
                     self.sandbox_authorization_details = Some(value);
                 }
@@ -1474,6 +1525,7 @@ impl ToolCall {
                 if meta_changed {
                     self.meta = meta.take();
                     self.subagent_session_info = subagent_session_info_from_meta(&self.meta);
+                    self.background_task = background_task_from_meta(&self.meta);
                     self.sandbox_authorization_details =
                         sandbox_authorization_details_from_meta(&self.meta);
                     self.sandbox_fallback_authorization_details =
