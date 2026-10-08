@@ -1,0 +1,64 @@
+# Builds a macOS .dmg from this fork, on a GitHub-hosted runner.
+#
+# Zed's own `run_bundling` workflow cannot run here: it targets Namespace
+# runners this fork has no access to, and Apple signing secrets it does not
+# hold. This one trades both away — a standard macOS runner, and the ad-hoc
+# signing that `script/bundle-mac` falls back to without those secrets. The
+# result installs and runs locally; it is not distributable.
+#
+# It takes the ref to build as an input, so it lives on this branch alone and
+# no feature branch has to carry a workflow file into its pull request.
+name: Build macOS app (fork)
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch, tag or SHA to build
+        required: true
+        default: acp-subagent-ux
+
+permissions:
+  contents: read
+
+jobs:
+  bundle_mac:
+    runs-on: macos-15
+    timeout-minutes: 180
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_INCREMENTAL: '0'
+      RUST_BACKTRACE: '1'
+    steps:
+      - name: Check out ${{ inputs.ref }}
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: Install the Metal toolchain
+        # Recent Xcode ships the Metal shader compiler as a separate download,
+        # and gpui's build script needs it. Older images already have it.
+        run: xcodebuild -downloadComponent MetalToolchain || true
+
+      - name: Show the toolchain
+        run: |
+          sw_vers
+          xcode-select -p
+          xcodebuild -version
+          xcrun -f metal || echo 'metal: unavailable'
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: aarch64-apple-darwin
+
+      - name: Bundle
+        run: ./script/bundle-mac aarch64-apple-darwin
+
+      - name: Upload the DMG
+        uses: actions/upload-artifact@v4
+        with:
+          name: Zed-aarch64
+          path: target/aarch64-apple-darwin/release/Zed-aarch64.dmg
+          if-no-files-found: error
+          retention-days: 14
